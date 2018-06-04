@@ -1,13 +1,8 @@
 package nbproxy
 
 import (
-	"errors"
-	"fmt"
 	"io/ioutil"
-	"log"
-	"net"
 	"net/http"
-	"net/url"
 	"sync"
 	"time"
 
@@ -16,82 +11,68 @@ import (
 
 var baseurl = "https://free-proxy-list.net/"
 
-var pool = struct {
-	m        map[string]bool
-	l        sync.Mutex
-	stopChan chan struct{}
-	doneChan chan struct{}
-	tickChan <-chan time.Time
-}{
-	make(map[string]bool),
-	sync.Mutex{},
-	make(chan struct{}),
-	make(chan struct{}),
-	time.Tick(30 * time.Minute),
+type proxyPool struct {
+	proxyAddrList []string
+	locker        sync.Mutex
+	tickChan      <-chan time.Time
+	stopChan      chan struct{}
+	doneChan      chan struct{}
 }
 
-type Client struct {
-	proxyAddr string
-	*http.Client
+func newProxyPool() (*proxyPool, error) {
+	addrList, err := fetchAddr()
+	if err != nil {
+		return nil, err
+	}
+	return &proxyPool{addrList, sync.Mutex{}, time.Tick(10 * time.Minute), make(chan struct{}), make(chan struct{})}, nil
 }
 
-func init() {
-	resp, err := http.Get(baseurl)
+func (p *proxyPool) refresh() error {
+	addrList, err := fetchAddr()
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-	defer resp.Body.Close()
-	content, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		log.Fatal(err)
+	p.locker.Lock()
+	defer p.locker.Unlock()
+	tempMap := make(map[string]bool)
+	for _, addr := range p.proxyAddrList {
+		tempMap[addr] = true
 	}
-	root, err := nbsoup.Parse(content)
-	if err != nil {
-		log.Fatal(err)
-	}
-	trs, err := nbsoup.FindAll(root, `table[id="proxylisttable"].tbody.tr`)
-	if err != nil {
-		log.Fatal(err)
-	}
-	for _, tr := range trs {
-		tds, err := nbsoup.FindAll(tr, `td`)
-		if err != nil {
-			log.Fatal(err)
+	for _, newAddr := range addrList {
+		if !tempMap[newAddr] {
+			p.proxyAddrList = append(p.proxyAddrList, newAddr)
 		}
-		addr := tds[0].Content
-		port := tds[1].Content
-		pool.m[addr+":"+port] = true
 	}
-	checkAll()
-	validNum := getValidNum()
-	if validNum == 0 {
-		log.Fatal(ErrEmptyPool)
-	}
-	go start()
+	return nil
 }
 
-func start() {
+func (p *proxyPool) run() {
 	for {
 		select {
-		case <-pool.stopChan:
-			close(pool.doneChan)
+		case <-p.stopChan:
+			close(p.doneChan)
 			return
-		case <-pool.tickChan:
-			pool.l.Lock()
-			defer pool.l.Unlock()
-			refreshPool()
-			revive()
-			checkAll()
-			if getValidNum() == 0 {
-				close(pool.stopChan)
-				continue
-			}
+		case <-p.tickChan:
+			p.refresh()
 		}
 	}
 }
 
-func ClosePool() {
-	close(pool.stopChan)
+func (p *proxyPool) pop() (string, bool) {
+	p.locker.Lock()
+	defer p.locker.Unlock()
+	if len(p.proxyAddrList) == 0 {
+		return "", false
+	}
+	var addr string
+	addr, p.proxyAddrList = p.proxyAddrList[0], p.proxyAddrList[1:]
+	return addr, true
+}
+
+func (p *proxyPool) push(addr string) {
+	p.locker.Lock()
+	defer p.locker.Unlock()
+	p.proxyAddrList = append(p.proxyAddrList, addr)
 }
 
 func fetchAddr() ([]string, error) {
@@ -108,7 +89,7 @@ func fetchAddr() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	trs, err := nbsoup.FindAll(root, `table[id="proxylisttable"].tbody.tr`)
+	trs, err := root.FindAll(`table[id="proxylisttable"].tbody.tr`)
 	if err != nil {
 		return nil, err
 	}
@@ -121,135 +102,4 @@ func fetchAddr() ([]string, error) {
 		addrList[i] = tds[0].Content + ":" + tds[1].Content
 	}
 	return addrList, nil
-}
-
-func checkAll() {
-	var checkLock sync.Mutex
-	invalidList := make([]string, 0, len(pool.m))
-	var wg sync.WaitGroup
-	for addr, status := range pool.m {
-		if status {
-			wg.Add(1)
-			go func(a string) {
-				fmt.Println(a)
-				defer wg.Done()
-				conn, err := net.DialTimeout("tcp", a, 10*time.Second)
-				if err != nil {
-					checkLock.Lock()
-					defer checkLock.Unlock()
-					invalidList = append(invalidList, a)
-					return
-				}
-				conn.Close()
-			}(addr)
-		}
-	}
-	wg.Wait()
-	for _, addr := range invalidList {
-		pool.m[addr] = false
-	}
-}
-
-func checkOne(addr string) bool {
-	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
-	if err != nil {
-		return false
-	}
-	conn.Close()
-	return true
-}
-
-func getValidNum() int {
-	var num int
-	for _, status := range pool.m {
-		if status {
-			num += 1
-		}
-	}
-	return num
-}
-
-func revive() {
-	for addr, status := range pool.m {
-		if !status {
-			conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
-			if err != nil {
-				continue
-			}
-			defer conn.Close()
-			pool.m[addr] = true
-		}
-	}
-}
-
-var ErrEmptyPool = errors.New("Empty pool")
-
-func refreshPool() error {
-	addrList, err := fetchAddr()
-	if err != nil {
-		return err
-	}
-	for _, addr := range addrList {
-		if _, ok := pool.m[addr]; !ok {
-			pool.m[addr] = true
-		}
-	}
-	checkAll()
-	validNum := getValidNum()
-	if validNum == 0 {
-		return ErrEmptyPool
-	}
-	return nil
-}
-
-var ErrPoolClosed = errors.New("proxy pool has closed")
-
-func Pop() (*Client, error) {
-	select {
-	case <-pool.doneChan:
-		return nil, ErrPoolClosed
-	default:
-		pool.l.Lock()
-		defer pool.l.Unlock()
-	ITER:
-		for addr, status := range pool.m {
-			if status && checkOne(addr) {
-				url, err := url.Parse("http://" + addr)
-				if err != nil {
-					return nil, err
-				}
-				client := &http.Client{
-					Timeout: 30 * time.Second,
-					Transport: &http.Transport{
-						Proxy: http.ProxyURL(url),
-					},
-				}
-				delete(pool.m, addr)
-				return &Client{addr, client}, nil
-			} else {
-				pool.m[addr] = false
-				continue
-			}
-		}
-		err := refreshPool()
-		if err != nil {
-			return nil, err
-		}
-		goto ITER
-	}
-}
-
-func Put(c *Client) error {
-	select {
-	case <-pool.doneChan:
-		return ErrPoolClosed
-	default:
-		if checkOne(c.proxyAddr) {
-			pool.l.Lock()
-			defer pool.l.Unlock()
-			pool.m[c.proxyAddr] = true
-		}
-		return nil
-
-	}
 }

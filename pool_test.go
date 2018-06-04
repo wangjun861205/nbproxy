@@ -2,26 +2,20 @@ package nbproxy
 
 import (
 	"fmt"
-	"io/ioutil"
 	"log"
 	"testing"
+	"time"
 )
 
 func TestPool(t *testing.T) {
-	defer ClosePool()
-	client, err := Pop()
+	client, err := NewClient(10 * time.Second)
 	if err != nil {
 		log.Fatal(err)
 	}
-	resp, err := client.Get("http://www.baidu.com")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer resp.Body.Close()
-	content, err := ioutil.ReadAll(resp.Body)
+	defer client.Close()
+	content, err := client.Get("http://www.baidu.com")
 	if err != nil {
 		log.Fatal(err)
 	}
 	fmt.Println(string(content))
-
 }
